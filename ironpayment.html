@@ -191,6 +191,7 @@
 
     .payment-actions{ margin-top:32px; display:flex; gap:16px; flex-wrap:wrap; }
     .payment-actions .btn{ flex:1; justify-content:center; }
+    .payment-status{ margin-top:14px; font-size:13px; color: var(--text-dim); line-height:1.5; }
 
     /* security badge */
     .secure-badge{
@@ -251,7 +252,7 @@
   <div class="payment-grid">
     <!-- LEFT: payment form -->
     <div class="payment-form">
-      <form id="paymentForm" onsubmit="event.preventDefault(); alert('Payment submitted (demo). Your membership will be activated upon receipt confirmation.');">
+      <form id="paymentForm">
 
         <!-- PAYMENT METHOD SELECTOR (local) -->
         <div class="form-group">
@@ -328,7 +329,7 @@
               <div class="upload-hint">📎 Optional: attach a screenshot too, in case automatic verification needs a human to double-check.</div>
             </div>
             <div class="local-info">
-              <strong>Bank transfer instructions:</strong> After you submit, you'll receive our bank details via email to complete the transfer. Once paid, come back and paste your transaction reference above — most banks confirm within seconds.
+              <strong>Bank transfer instructions:</strong> Send the amount to CBE account <strong>1000764452473</strong>, then paste the transaction reference above. Once we receive the verification data, we’ll review and confirm it.
             </div>
           </div>
 
@@ -358,10 +359,14 @@
           </div>
         </div>
 
-        <!-- SHARED FIELDS (name, email, billing) -->
+        <!-- SHARED FIELDS (name, phone, email, billing) -->
         <div class="form-group" style="margin-top:10px;">
           <label for="fullName">Full name</label>
           <input type="text" id="fullName" placeholder="Dawit Bekele" value="Dawit Bekele">
+        </div>
+        <div class="form-group">
+          <label for="phone">Phone number</label>
+          <input type="text" id="phone" placeholder="0911 22 33 44" value="0911 22 33 44">
         </div>
         <div class="form-group">
           <label for="email">Email address</label>
@@ -376,6 +381,7 @@
           <button type="submit" class="btn btn-rust" id="payButton">Pay now — ETB 3,200</button>
           <a href="#" class="btn btn-outline-dark">Cancel</a>
         </div>
+        <div id="paymentStatus" class="payment-status">Submit your details and we will verify your transfer.</div>
 
         <div class="secure-badge">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
@@ -457,11 +463,13 @@
     const summaryPlan = document.getElementById('summaryPlan');
     const summarySubtotal = document.getElementById('summarySubtotal');
     const summaryTotal = document.getElementById('summaryTotal');
+    const paymentStatus = document.getElementById('paymentStatus');
 
     const params = new URLSearchParams(window.location.search);
     const selectedPlan = params.get('label') || 'Standard Quarterly';
     const selectedAmount = Number(params.get('amount') || 3600);
     const selectedPeriod = params.get('period') || (selectedAmount >= 17000 ? '/yr' : selectedAmount >= 3600 ? '/3 mo' : '/mo');
+    const selectedMemberId = params.get('member_id') || null;
 
     function updateSummary() {
       const formattedAmount = `ETB ${selectedAmount.toLocaleString()}`;
@@ -473,17 +481,18 @@
       payButton.textContent = `Pay now — ${formattedAmount}`;
     }
 
+    function setPaymentStatus(message, color) {
+      paymentStatus.textContent = message;
+      paymentStatus.style.color = color || 'var(--text-dim)';
+    }
+
     function setMethod(method) {
-      // update active class
       methodBtns.forEach(btn => btn.classList.remove('active'));
       document.querySelector(`.method-btn[data-method="${method}"]`).classList.add('active');
-
-      // show/hide sections
       cardSection.style.display = (method === 'card') ? 'block' : 'none';
       bankSection.style.display = (method === 'bank') ? 'block' : 'none';
       telebirrSection.style.display = (method === 'telebirr') ? 'block' : 'none';
 
-      // update button text
       if (method === 'card') payButton.textContent = `Pay now — ETB ${selectedAmount.toLocaleString()}`;
       else if (method === 'bank') payButton.textContent = 'Submit bank transfer & receipt';
       else if (method === 'telebirr') payButton.textContent = 'Submit Telebirr payment & receipt';
@@ -497,19 +506,112 @@
     });
 
     updateSummary();
-
-    // default: card
     setMethod('card');
 
-    // keep the "verify against X" hint in sync with the selected bank
     const bankSelect = document.getElementById('bankName');
     const bankNameHint = document.getElementById('bankNameHint');
+    const paymentForm = document.getElementById('paymentForm');
+    const bankReference = document.getElementById('bankReference');
+    const bankReceiptFile = document.getElementById('bankReceiptFile');
+    const accountHolder = document.getElementById('accountHolder');
+    const fullNameInput = document.getElementById('fullName');
+    const phoneInput = document.getElementById('phone');
+
     if (bankSelect && bankNameHint) {
       bankSelect.addEventListener('change', function() {
         bankNameHint.textContent = this.options[this.selectedIndex].text;
       });
       bankNameHint.textContent = bankSelect.options[bankSelect.selectedIndex].text;
     }
+
+    const UPLOAD_RECEIPT_URL = '/api/upload-receipt';
+    const SUBMIT_PAYMENT_URL = '/api/submit-payment';
+
+    async function uploadReceipt(file) {
+      if (!file) return null;
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await fetch(UPLOAD_RECEIPT_URL, { method: 'POST', body: formData });
+      if (!response.ok) throw new Error('Receipt upload failed');
+      const data = await response.json();
+      return data.url;
+    }
+
+    async function submitToEdgeFunction(body) {
+      const response = await fetch(SUBMIT_PAYMENT_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': 'YOUR_SUPABASE_ANON_KEY'
+        },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.message || 'Payment submission failed');
+      }
+      return response.json();
+    }
+
+    paymentForm.addEventListener('submit', async function(event) {
+      event.preventDefault();
+
+      if (bankSection.style.display === 'block') {
+        if (!bankReference.value.trim()) {
+          setPaymentStatus('Please enter the bank transaction reference.', '#ffbaba');
+          bankReference.focus();
+          return;
+        }
+        if (!accountHolder.value.trim()) {
+          setPaymentStatus('Please enter the account holder name.', '#ffbaba');
+          accountHolder.focus();
+          return;
+        }
+      }
+
+      payButton.disabled = true;
+      setPaymentStatus('Validating your transfer. Please wait...', 'var(--text-light)');
+      payButton.textContent = 'Verifying…';
+
+      try {
+        let screenshotUrl = null;
+        if (bankReceiptFile && bankReceiptFile.files.length) {
+          screenshotUrl = await uploadReceipt(bankReceiptFile.files[0]);
+        }
+
+        const payload = {
+          plan: selectedPlan,
+          expected_amount: selectedAmount,
+          bank_code: bankSelect.value,
+          reference: bankReference.value.trim(),
+          account_holder_name: accountHolder.value.trim(),
+          customer_name: fullNameInput.value.trim(),
+          customer_phone: phoneInput.value.trim(),
+          screenshot_url: screenshotUrl,
+          receiving_bank_account: '1000764452473',
+          member_id: selectedMemberId
+        };
+
+        const result = await submitToEdgeFunction(payload);
+
+        if (result.status === 'paid') {
+          setPaymentStatus('✅ Payment confirmed. Your membership is active.', '#b8ffb8');
+          payButton.textContent = 'Payment confirmed';
+          payButton.classList.add('btn-success');
+        } else if (result.status === 'needs_review') {
+          setPaymentStatus('⏳ We’re reviewing this payment. You’ll hear from us shortly.', '#ffd6a5');
+          payButton.textContent = 'Pending review';
+        } else {
+          setPaymentStatus('⚠️ Payment submitted. Verification is in progress.', '#ffd6a5');
+          payButton.textContent = 'Processing…';
+        }
+      } catch (error) {
+        setPaymentStatus(`Submission failed: ${error.message}`, '#ffbaba');
+        payButton.textContent = 'Try again';
+      } finally {
+        payButton.disabled = false;
+      }
+    });
   })();
 </script>
 
